@@ -1,1 +1,80 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>电网恢复调度</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style><h1>电网事故应急与恢复调度</h1><p>停运事件、安全约束恢复计划、重要用户、离线上报合并、异常遥测隔离和状态发布。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre><script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script></html>
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>电网恢复调度</title><style>
+body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}
+pre{background:#f3f5f7;padding:16px;overflow:auto}
+button{padding:8px 14px}
+table{border-collapse:collapse;margin:8px 0}
+th,td{border:1px solid #cbd2d9;padding:4px 10px;font-size:14px;text-align:left}
+.conflict{color:#b3261e}.ok{color:#1a7f37}.stale{color:#9a6700}
+input,select{padding:4px 6px;margin:2px}
+</style>
+<h1>电网事故应急与恢复调度</h1>
+<p>停运事件、安全约束恢复计划、重要用户、离线上报合并、异常遥测隔离和状态发布。</p>
+<h2>轮换保供</h2>
+<p>备用容量不足时按事故、起止时间和容量排批：一级用户全程保留，二三级按功率轮流；容量不足只报冲突与待调整用户，候选安排不写入。</p>
+<div>
+<label>事故 <input id="rotOutage" type="number" value="1" style="width:64px"></label>
+<label>开始 <input id="rotStart" size="22" value="2026-09-27T08:00:00Z"></label>
+<label>结束 <input id="rotEnd" size="22" value="2026-09-27T20:00:00Z"></label>
+<label>备用容量MW <input id="rotCap" type="number" value="60" style="width:80px"></label>
+<label>身份 <input id="actorInp" size="14" value="dispatcher-demo"></label>
+<label>角色 <select id="roleInp"><option>dispatcher</option><option>field</option></select></label>
+<button onclick="previewRotation()">预览候选</button>
+<button onclick="commitRotation()">提交批次</button>
+<button onclick="loadRotation()">刷新轮换表</button>
+</div>
+<div id="rotMsg"></div>
+<div id="rotView"></div>
+<h2>系统状态</h2>
+<button onclick="loadState()">刷新状态</button>
+<pre id="state">加载中...</pre>
+<script>
+const el=id=>document.getElementById(id);
+const H=()=>({"Content-Type":"application/json","X-Actor":el("actorInp").value,"X-Role":el("roleInp").value});
+const esc=s=>String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+async function api(path,opts){const r=await fetch(path,opts);const b=await r.json().catch(()=>({}));if(!r.ok)throw b;return b}
+const rotBody=()=>JSON.stringify({start_at:el("rotStart").value,end_at:el("rotEnd").value,capacity_mw:+el("rotCap").value});
+function slotTable(list,withOps,batch){
+  const head="<tr><th>用户</th><th>优先级</th><th>时段</th><th>功率MW</th><th>安排</th>"+(withOps?"<th>状态</th><th>现场操作</th>":"")+"</tr>";
+  const rows=list.map(a=>{
+    const ops=withOps&&batch.state==="active"?`<button onclick="supply(${batch.id},${a.facility_id},'connected')">接通</button> <button onclick="supply(${batch.id},${a.facility_id},'disconnected')">停供</button>`:"";
+    return `<tr><td>${esc(a.name)}</td><td>${a.priority}级</td><td>${esc(a.slot_start)} ~ ${esc(a.slot_end)}</td><td>${a.allocated_mw}</td><td>${a.round_no?"第"+a.round_no+"轮":"全程保留"}</td>`+(withOps?`<td>${esc(a.state)}</td><td>${ops}</td>`:"")+"</tr>"}).join("");
+  return `<table>${head}${rows}</table>`;
+}
+function reportHtml(c){
+  let h="";
+  if(c.conflicts&&c.conflicts.length)h+=`<p class="conflict">冲突：${c.conflicts.map(esc).join("；")}</p>`;
+  if(c.pending&&c.pending.length)h+=`<p class="stale">待调整用户：${c.pending.map(p=>esc(p.name)+"（"+esc(p.reason)+"）").join("；")}</p>`;
+  return h;
+}
+async function previewRotation(){
+  try{
+    const c=await api(`/api/outages/${el("rotOutage").value}/rotation-batches/preview`,{method:"POST",headers:H(),body:rotBody()});
+    el("rotMsg").innerHTML=reportHtml(c);
+    el("rotView").innerHTML=`<h3>候选安排（未写入）</h3><p>余量 ${c.margin_mw} MW ｜ 容量 ${c.capacity_mw} MW ｜ 一级基线 ${c.baseline_mw} MW ｜ 轮换 ${c.rounds} 轮</p>`+slotTable(c.assignments,false);
+  }catch(e){el("rotMsg").innerHTML=`<p class="conflict">${esc(e.error||"预览失败")}</p>`}
+}
+async function commitRotation(){
+  try{
+    await api(`/api/outages/${el("rotOutage").value}/rotation-batches`,{method:"POST",headers:H(),body:rotBody()});
+    el("rotMsg").innerHTML='<p class="ok">批次已写入</p>';
+    await loadRotation();
+  }catch(e){el("rotMsg").innerHTML=`<p class="conflict">${esc(e.error||"提交失败")}</p>`+reportHtml(e)}
+}
+async function loadRotation(){
+  const v=await api(`/api/outages/${el("rotOutage").value}/rotation`);
+  let h="<h3>在供清单</h3>";
+  h+=v.supply.length?`<table><tr><th>用户</th><th>优先级</th><th>功率MW</th><th>批次</th></tr>${v.supply.map(s=>`<tr><td>${esc(s.name)}</td><td>${s.priority}级</td><td>${s.allocated_mw}</td><td>#${s.batch_id}</td></tr>`).join("")}</table>`:"<p>当前没有在供用户</p>";
+  for(const b of v.batches){
+    const tag=b.state==="active"?'<span class="ok">在效</span>':`<span class="stale">已失效：${esc(b.invalid_reason||"")}</span>`;
+    h+=`<h3>批次 #${b.id} ${tag}</h3><p>${esc(b.start_at)} ~ ${esc(b.end_at)} ｜ 容量 ${b.capacity_mw} MW ｜ 余量 ${b.margin_mw} MW ｜ 计划版本 v${b.plan_version}</p>`+slotTable(b.assignments,true,b);
+  }
+  if(!v.batches.length)h+="<p>暂无轮换批次</p>";
+  el("rotView").innerHTML=h;
+}
+async function supply(batchId,facilityId,action){
+  try{await api(`/api/rotation-batches/${batchId}/supply`,{method:"POST",headers:H(),body:JSON.stringify({facility_id:facilityId,action})});await loadRotation()}
+  catch(e){el("rotMsg").innerHTML=`<p class="conflict">${esc(e.error||"操作失败")}</p>`}
+}
+async function loadState(){el("state").textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}
+loadState();loadRotation().catch(()=>{});
+</script></html>

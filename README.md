@@ -23,6 +23,16 @@ python3 app.py
 - `POST /api/status`：发布当前恢复状态。
 - `GET /api/plans/{id}`、`GET /api/state`、`GET /api/health`：详情、状态和健康检查。
 
+## 轮换保供
+
+备用容量不够带全部重要用户时按事故、起止时间和容量排批：一级用户全程保留，二三级按功率轮流，同一用户不会落在重叠时段。规则在 `rotation_rules.py`（纯函数，不写库），存储与 HTTP 在 `app.py`，页面在 `static/index.html`。
+
+- `POST /api/outages/{id}/rotation-batches/preview`：生成候选轮换安排，永不写入。
+- `POST /api/outages/{id}/rotation-batches`：提交批次；容量不足返回 409、冲突与待调整用户，候选不写入；时段重叠的旧批次被替代。
+- `GET /api/outages/{id}/rotation`：轮换表、余量、在供清单与失效原因。
+- `POST /api/rotation-batches/{id}/supply`：现场接通/停供（`field` 或 `dispatcher`），更新在供清单。
+- `POST /api/facilities/{id}/power`：调整用户功率；用户功率、清单或计划版本变化会让旧批次失效并记录原因。
+
 ## 测试
 
 ```bash
