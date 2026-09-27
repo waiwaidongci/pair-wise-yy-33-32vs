@@ -11,6 +11,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+import rotation as rot
+
 DB_PATH = Path(__file__).with_name("data.db")
 
 
@@ -23,8 +25,8 @@ def j(value: object) -> str:
 
 
 class ApiError(Exception):
-    def __init__(self, status: int, message: str):
-        super().__init__(message); self.status, self.message = status, message
+    def __init__(self, status: int, message: str, extra: dict | None = None):
+        super().__init__(message); self.status, self.message, self.extra = status, message, extra or {}
 
 
 class Store:
@@ -76,6 +78,24 @@ class Store:
         CREATE TABLE IF NOT EXISTS published_status (
           id INTEGER PRIMARY KEY AUTOINCREMENT, outage_id INTEGER NOT NULL REFERENCES outages(id),
           plan_id INTEGER NOT NULL REFERENCES plans(id), version INTEGER NOT NULL, status_json TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS rotation_schedules (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, outage_id INTEGER NOT NULL REFERENCES outages(id),
+          state TEXT NOT NULL CHECK(state IN ('active','superseded','invalidated')),
+          capacity_mw REAL NOT NULL, start_time TEXT NOT NULL, end_time TEXT NOT NULL,
+          slot_minutes INTEGER, basis_json TEXT NOT NULL, invalid_reasons_json TEXT,
+          created_by TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS rotation_batches (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, schedule_id INTEGER NOT NULL REFERENCES rotation_schedules(id),
+          batch_no INTEGER NOT NULL, start_time TEXT NOT NULL, end_time TEXT NOT NULL,
+          facility_ids_json TEXT NOT NULL, UNIQUE(schedule_id,batch_no)
+        );
+        CREATE TABLE IF NOT EXISTS supply_status (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, schedule_id INTEGER NOT NULL REFERENCES rotation_schedules(id),
+          facility_id INTEGER NOT NULL, status TEXT NOT NULL CHECK(status IN ('on','off')),
+          updated_by TEXT NOT NULL, updated_at TEXT NOT NULL, note TEXT,
+          UNIQUE(schedule_id,facility_id)
         );
         CREATE TABLE IF NOT EXISTS audit_log (
           id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
@@ -269,6 +289,245 @@ class GridService:
             self.store.audit(actor, "status.publish", "outage", outage_id, {"plan_id": plan_id, "state": status["state"]})
         return {"id": cur.lastrowid, "status": status}
 
+    # ---------- 轮换保供 ----------
+    def _scope_universe(self, outage_id: int) -> list[dict]:
+        outage = self._row("outages", outage_id)
+        regions = json.loads(outage["affected_regions_json"])
+        placeholders = ",".join("?" for _ in regions)
+        rows = self.conn.execute(
+            f"SELECT id,name,priority,backup_power_mw FROM facilities WHERE connected=1 AND asset_id IN "
+            f"(SELECT id FROM assets WHERE region IN ({placeholders}))", regions).fetchall()
+        return [{"id": r["id"], "name": r["name"], "priority": r["priority"], "power_mw": r["backup_power_mw"]}
+                for r in sorted(rows, key=lambda r: (r["priority"], r["id"]))]
+
+    def _current_plan_version(self, outage_id: int) -> int:
+        row = self.conn.execute("SELECT COALESCE(MAX(version),0) AS v FROM plans WHERE outage_id=?", (outage_id,)).fetchone()
+        return int(row["v"])
+
+    def _rotation_input(self, body: dict, require_outage: bool = True) -> tuple:
+        outage_id = int(body.get("outage_id", 0) or 0)
+        outage = self._row("outages", outage_id) if require_outage else None
+        universe = self._scope_universe(outage_id) if require_outage else []
+        current_version = self._current_plan_version(outage_id) if require_outage else 0
+        try:
+            capacity = float(body["capacity_mw"])
+            if capacity <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise ApiError(400, "备用容量必须为正数")
+        start, end = str(body.get("start_time", "")), str(body.get("end_time", ""))
+        try:
+            if rot.parse_ts(start) >= rot.parse_ts(end):
+                raise ValueError
+        except ValueError as exc:
+            raise ApiError(400, f"轮换起止时间不合法：{exc}")
+        batches = body.get("batches")
+        slot = int(body.get("slot_minutes") or rot.DEFAULT_SLOT_MINUTES)
+        return outage, universe, current_version, capacity, start, end, batches, slot
+
+    def preview_rotation(self, actor: str | None, role: str | None, body: dict) -> dict:
+        self._actor(actor, role, {"dispatcher", "operator", "field"})
+        outage, universe, current_version, capacity, start, end, batches, slot = self._rotation_input(body)
+        candidate = self._candidate(universe, capacity, start, end, batches, slot)
+        candidate["outage_id"] = outage["id"]
+        candidate["incident_code"] = outage["incident_code"]
+        return candidate
+
+    def _candidate(self, universe: list[dict], capacity: float, start: str, end: str,
+                   batches: object, slot: int) -> dict:
+        if batches:
+            if not isinstance(batches, list):
+                raise ApiError(400, "批次列表格式不合法")
+            try:
+                candidate = rot.evaluate(universe, capacity, start, end, batches)
+            except (TypeError, ValueError) as exc:
+                raise ApiError(400, f"批次参数不合法：{exc}")
+        else:
+            try:
+                candidate = rot.build_batches(universe, capacity, start, end, slot)
+            except (TypeError, ValueError) as exc:
+                raise ApiError(400, f"自动排批参数不合法：{exc}")
+        candidate["basis_fingerprint"] = rot.facilities_fingerprint(universe)
+        return candidate
+
+    def create_rotation_schedule(self, actor: str | None, role: str | None, body: dict) -> dict:
+        actor = self._actor(actor, role, {"dispatcher"})
+        outage, universe, current_version, capacity, start, end, batches, slot = self._rotation_input(body)
+        candidate = self._candidate(universe, capacity, start, end, batches, slot)
+        if not candidate["feasible"]:
+            # 候选安排不写入，仅回传冲突和待调整用户
+            raise ApiError(409, "候选轮换安排存在容量或时段冲突，未写入",
+                           {"outage_id": outage["id"], "incident_code": outage["incident_code"], "candidate": candidate})
+        basis = {"fingerprint": candidate["basis_fingerprint"], "plan_version": current_version,
+                 "capacity_mw": capacity, "universe": universe}
+        with self.conn:
+            old = self.conn.execute("SELECT id FROM rotation_schedules WHERE outage_id=? AND state='active'", (outage["id"],)).fetchall()
+            for row in old:
+                self.conn.execute("UPDATE rotation_schedules SET state='superseded' WHERE id=?", (row["id"],))
+            cur = self.conn.execute("""INSERT INTO rotation_schedules(outage_id,state,capacity_mw,start_time,end_time,slot_minutes,basis_json,created_by,created_at)
+                                     VALUES(?, 'active',?,?,?,?,?,?,?)""",
+                                    (outage["id"], capacity, start, end, None if batches else slot,
+                                     j(basis), actor, now()))
+            schedule_id = cur.lastrowid
+            for b in candidate["rotation_table"]:
+                self.conn.execute("INSERT INTO rotation_batches(schedule_id,batch_no,start_time,end_time,facility_ids_json) VALUES(?,?,?,?,?)",
+                                  (schedule_id, b["batch_no"], b["start_time"], b["end_time"],
+                                   j([f["id"] for f in b["facilities"]])))
+            for f in candidate["always_on"]:
+                self.conn.execute("INSERT INTO supply_status(schedule_id,facility_id,status,updated_by,updated_at,note) VALUES(?,?, 'on',?,?,?)",
+                                  (schedule_id, f["id"], actor, now(), "一级用户全程保留"))
+            self.store.audit(actor, "rotation.create", "rotation_schedule", schedule_id,
+                             {"outage_id": outage["id"], "batches": len(candidate["rotation_table"]),
+                              "capacity_mw": capacity, "superseded": [r["id"] for r in old]})
+        return self.rotation_detail(schedule_id)
+
+    def rotation_detail(self, schedule_id: int) -> dict:
+        row = self.conn.execute("SELECT * FROM rotation_schedules WHERE id=?", (schedule_id,)).fetchone()
+        if not row:
+            raise ApiError(404, "轮换安排不存在")
+        return self._rotation_detail(row)
+
+    def _rotation_detail(self, row: sqlite3.Row) -> dict:
+        basis = json.loads(row["basis_json"])
+        reasons = json.loads(row["invalid_reasons_json"] or "[]")
+        is_active = row["state"] == "active"
+        if is_active:
+            reasons = rot.basis_reasons(basis["fingerprint"], basis["plan_version"],
+                                        self._scope_universe(row["outage_id"]),
+                                        self._current_plan_version(row["outage_id"]))
+        batches = [dict(b) for b in self.conn.execute(
+            "SELECT batch_no,start_time,end_time,facility_ids_json FROM rotation_batches WHERE schedule_id=? ORDER BY batch_no",
+            (row["id"],))]
+        live_by_id = {f["id"]: f for f in self._scope_universe(row["outage_id"])}
+        name_by_id = {f["id"]: f["name"] for f in basis["universe"]}
+        expected_ids = {f["id"] for f in basis["universe"] if f["priority"] == 1}
+        table = []
+        for b in batches:
+            ids = json.loads(b["facility_ids_json"])
+            expected_ids.update(ids)
+            table.append({"batch_no": b["batch_no"], "start_time": b["start_time"], "end_time": b["end_time"],
+                          "facilities": [live_by_id.get(i) or {"id": i, "name": name_by_id.get(i, str(i))} for i in ids]})
+        candidate = rot.evaluate(basis["universe"], basis["capacity_mw"], row["start_time"], row["end_time"],
+                                 [{"batch_no": b["batch_no"], "start_time": b["start_time"], "end_time": b["end_time"],
+                                   "facility_ids": json.loads(b["facility_ids_json"])} for b in batches])
+        now_iso = now()
+        try:
+            current_dt = rot.parse_ts(now_iso)
+            current_on = {f["id"] for f in basis["universe"] if f["priority"] == 1}
+            for b in batches:
+                if rot.parse_ts(b["start_time"]) <= current_dt < rot.parse_ts(b["end_time"]):
+                    current_on.update(json.loads(b["facility_ids_json"]))
+        except ValueError:
+            current_on = set()
+
+        status_rows = self.conn.execute("SELECT * FROM supply_status WHERE schedule_id=?", (row["id"],)).fetchall()
+        live_power = {i: f["power_mw"] for i, f in live_by_id.items()}
+        supply = []
+        actual_load = 0.0
+        for s in status_rows:
+            expected = "on" if s["facility_id"] in current_on else "off"
+            mismatch = s["status"] != expected
+            f = live_by_id.get(s["facility_id"]) or next((x for x in basis["universe"] if x["id"] == s["facility_id"]), None)
+            power = (f or {}).get("power_mw", 0)
+            if s["status"] == "on":
+                actual_load += power
+            supply.append({"facility_id": s["facility_id"],
+                           "name": (f or {"name": name_by_id.get(s["facility_id"], str(s["facility_id"]))})["name"],
+                           "status": s["status"], "expected_status": expected, "mismatch": mismatch,
+                           "updated_by": s["updated_by"], "updated_at": s["updated_at"], "note": s["note"]})
+        supply.sort(key=lambda x: x["facility_id"])
+        outage = self.conn.execute("SELECT incident_code FROM outages WHERE id=?", (row["outage_id"],)).fetchone()
+        return {"id": row["id"], "outage_id": row["outage_id"], "incident_code": outage["incident_code"] if outage else None,
+                "state": row["state"], "capacity_mw": row["capacity_mw"], "start_time": row["start_time"],
+                "end_time": row["end_time"], "slot_minutes": row["slot_minutes"],
+                "always_on": candidate["always_on"], "rotation_table": table,
+                "segments": candidate["segments"], "unscheduled": candidate["unscheduled"],
+                "pending_facility_ids": candidate["pending_facility_ids"],
+                "current_time": now_iso, "expected_on_ids": sorted(current_on),
+                "supply": supply, "actual_load_mw": round(actual_load, 3),
+                "live_margin_mw": round(float(row["capacity_mw"]) - actual_load, 3),
+                "basis_plan_version": basis["plan_version"], "current_plan_version": self._current_plan_version(row["outage_id"]),
+                "invalid_reasons": reasons}
+
+    def _check_rotation_active(self, schedule_id: int) -> sqlite3.Row:
+        row = self.conn.execute("SELECT * FROM rotation_schedules WHERE id=?", (schedule_id,)).fetchone()
+        if not row:
+            raise ApiError(404, "轮换安排不存在")
+        if row["state"] != "active":
+            raise ApiError(409, "轮换安排已被新版本取代")
+        basis = json.loads(row["basis_json"])
+        reasons = rot.basis_reasons(basis["fingerprint"], basis["plan_version"],
+                                    self._scope_universe(row["outage_id"]),
+                                    self._current_plan_version(row["outage_id"]))
+        if reasons:
+            with self.conn:
+                self.conn.execute("UPDATE rotation_schedules SET state='invalidated',invalid_reasons_json=? WHERE id=?",
+                                  (j(reasons), schedule_id))
+                self.store.audit("system", "rotation.invalidate", "rotation_schedule", schedule_id, {"reasons": reasons})
+            raise ApiError(409, "轮换安排依据已变化并失效，请重新编制", {"invalid_reasons": reasons})
+        return row
+
+    def set_supply(self, actor: str | None, role: str | None, body: dict) -> dict:
+        actor = self._actor(actor, role, {"field", "dispatcher", "operator"})
+        schedule_id = int(body.get("schedule_id", 0) or 0)
+        facility_id = int(body.get("facility_id", 0) or 0)
+        status = body.get("status")
+        note = str(body.get("note", ""))
+        if status not in {"on", "off"}:
+            raise ApiError(400, "在供状态只能是 on（接通）或 off（停供）")
+        row = self._check_rotation_active(schedule_id)
+        facility = self.conn.execute("SELECT * FROM facilities WHERE id=?", (facility_id,)).fetchone()
+        if not facility:
+            raise ApiError(404, "用户不存在")
+        basis = json.loads(row["basis_json"])
+        if not any(f["id"] == facility_id for f in basis["universe"]):
+            raise ApiError(400, "该用户不在本次轮换影响范围内")
+        batch_ids = {i for b in self.conn.execute("SELECT facility_ids_json FROM rotation_batches WHERE schedule_id=?", (schedule_id,))
+                     for i in json.loads(b["facility_ids_json"])}
+        always_ids = {f["id"] for f in basis["universe"] if f["priority"] == 1}
+        if facility_id not in batch_ids | always_ids:
+            raise ApiError(409, "该用户不在轮换保供名单中（全程停供），如需送电请重新编制安排")
+        with self.conn:
+            self.conn.execute("""INSERT INTO supply_status(schedule_id,facility_id,status,updated_by,updated_at,note) VALUES(?,?,?,?,?,?)
+                               ON CONFLICT(schedule_id,facility_id) DO UPDATE SET status=excluded.status,updated_by=excluded.updated_by,updated_at=excluded.updated_at,note=excluded.note""",
+                              (schedule_id, facility_id, status, actor, now(), note))
+            self.store.audit(actor, "rotation.supply", "rotation_schedule", schedule_id,
+                             {"facility_id": facility_id, "status": status, "note": note})
+        return self.rotation_detail(schedule_id)
+
+    def update_facility_power(self, actor: str | None, role: str | None, facility_id: int, power_mw: float) -> dict:
+        actor = self._actor(actor, role, {"dispatcher"})
+        facility = self._row("facilities", facility_id)
+        try:
+            power = float(power_mw)
+            if power < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise ApiError(400, "用户功率不合法")
+        with self.conn:
+            self.conn.execute("UPDATE facilities SET backup_power_mw=? WHERE id=?", (power, facility_id))
+            self.store.audit(actor, "facility.power_update", "facility", facility_id,
+                             {"old_mw": facility["backup_power_mw"], "new_mw": power})
+        return {"id": facility_id, "name": facility["name"], "backup_power_mw": power}
+
+    def rotation_summaries(self) -> list[dict]:
+        out = []
+        for row in self.conn.execute("SELECT * FROM rotation_schedules ORDER BY id DESC"):
+            basis = json.loads(row["basis_json"])
+            if row["state"] == "active":
+                reasons = rot.basis_reasons(basis["fingerprint"], basis["plan_version"],
+                                            self._scope_universe(row["outage_id"]),
+                                            self._current_plan_version(row["outage_id"]))
+                state = "stale" if reasons else "active"
+            else:
+                state, reasons = row["state"], json.loads(row["invalid_reasons_json"] or "[]")
+            out.append({"id": row["id"], "outage_id": row["outage_id"], "state": state,
+                        "capacity_mw": row["capacity_mw"], "start_time": row["start_time"], "end_time": row["end_time"],
+                        "basis_plan_version": basis["plan_version"],
+                        "current_plan_version": self._current_plan_version(row["outage_id"]),
+                        "invalid_reasons": reasons})
+        return out
+
     def _validate_steps(self, steps: list[dict]) -> list[dict]:
         if not steps: raise ApiError(400, "恢复计划至少需要一个步骤")
         normalized = []; seqs = set()
@@ -327,6 +586,7 @@ class GridService:
                 "facilities": [dict(row) for row in self.conn.execute("SELECT * FROM facilities ORDER BY priority,id")],
                 "outages": [self._outage_dict(row) for row in self.conn.execute("SELECT * FROM outages ORDER BY id DESC")],
                 "plans": [self._plan_dict(row) for row in self.conn.execute("SELECT * FROM plans ORDER BY id DESC")],
+                "rotations": self.rotation_summaries(),
                 "telemetry_anomalies": [dict(row) for row in self.conn.execute("SELECT * FROM telemetry WHERE valid=0 ORDER BY id DESC LIMIT 20")],
                 "audits": [dict(row) for row in self.conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 30")]}
 
@@ -335,6 +595,10 @@ class GridService:
             a = self.register_asset("dispatcher-demo", "dispatcher", "SUB-1", "中心站", "substation", 200, "城区")
             self.register_asset("dispatcher-demo", "dispatcher", "LINE-1", "一号线", "line", 120, "城区", a["id"])
             self.register_facility("dispatcher-demo", "dispatcher", "市医院", "hospital", a["id"], 1, 50)
+            self.register_facility("dispatcher-demo", "dispatcher", "第一水厂", "water", a["id"], 2, 40)
+            self.register_facility("dispatcher-demo", "dispatcher", "通信枢纽", "telecom", a["id"], 2, 30)
+            self.register_facility("dispatcher-demo", "dispatcher", "冷链仓库", "coldchain", a["id"], 3, 45)
+            self.register_facility("dispatcher-demo", "dispatcher", "商业综合体", "mall", a["id"], 3, 25)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -355,11 +619,13 @@ class Handler(BaseHTTPRequestHandler):
             if p in (["health"], ["api", "health"]): out = {"status": "ok"}
             elif p == ["api", "state"]: out = self.service.state()
             elif len(p) == 3 and p[:2] == ["api", "plans"]: out = self.service.plan_detail(int(p[2]))
+            elif len(p) == 3 and p[:2] == ["api", "rotations"]: out = self.service.rotation_detail(int(p[2]))
+            elif p == ["api", "rotations"]: out = {"schedules": self.service.rotation_summaries()}
             elif not p:
                 page = (Path(__file__).parent / "static" / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page); return
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
-        except ApiError as exc: self._send(exc.status, {"error": exc.message})
+        except ApiError as exc: self._send(exc.status, {"error": exc.message, **exc.extra})
         except Exception as exc: self._send(500, {"error": str(exc)})
 
     def do_POST(self) -> None:
@@ -377,9 +643,13 @@ class Handler(BaseHTTPRequestHandler):
             elif p == ["api", "field-reports"]: out = self.service.field_report(actor, role, int(b.get("plan_id", 0)), int(b.get("step_no", 0)), b.get("client_report_id", ""), int(b.get("expected_plan_version", 0)), b.get("status", ""), b.get("note", ""))
             elif len(p) == 4 and p[:2] == ["api", "plans"] and p[3] == "confirm": out = self.service.confirm_step(actor, role, int(p[2]), int(b.get("step_no", 0)), b.get("decision", "confirmed"), b.get("note", ""))
             elif p == ["api", "status"]: out = self.service.publish_status(actor, role, int(b.get("outage_id", 0)), int(b.get("plan_id", 0)))
+            elif p == ["api", "rotations", "preview"]: out = self.service.preview_rotation(actor, role, b)
+            elif p == ["api", "rotations"]: out = self.service.create_rotation_schedule(actor, role, b)
+            elif p == ["api", "supply"]: out = self.service.set_supply(actor, role, b)
+            elif len(p) == 4 and p[:2] == ["api", "facilities"] and p[3] == "power": out = self.service.update_facility_power(actor, role, int(p[2]), float(b.get("backup_power_mw", -1)))
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
-        except ApiError as exc: self._send(exc.status, {"error": exc.message})
+        except ApiError as exc: self._send(exc.status, {"error": exc.message, **exc.extra})
         except (ValueError, TypeError, sqlite3.IntegrityError) as exc: self._send(400, {"error": str(exc)})
         except Exception as exc: self._send(500, {"error": str(exc)})
 

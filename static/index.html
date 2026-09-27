@@ -1,1 +1,248 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>电网恢复调度</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style><h1>电网事故应急与恢复调度</h1><p>停运事件、安全约束恢复计划、重要用户、离线上报合并、异常遥测隔离和状态发布。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre><script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script></html>
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>轮换保供调度</title>
+<style>
+  :root { --bad:#b3261e; --ok:#1b7f3b; --warn:#a0620a; --line:#d8dde3; --bg:#f3f5f7; }
+  * { box-sizing:border-box; }
+  body { font:15px/1.5 system-ui, "PingFang SC", "Microsoft YaHei", sans-serif; max-width:1180px; margin:0 auto; padding:20px; color:#1d2430; }
+  h1 { font-size:22px; margin:0 0 4px; } h2 { font-size:17px; margin:24px 0 10px; }
+  .muted { color:#5b6675; font-size:13px; }
+  .bar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; background:#fff; border:1px solid var(--line); border-radius:8px; padding:10px 12px; margin:12px 0; }
+  label { font-size:13px; color:#3b4655; } input, select, textarea { font:inherit; padding:6px 8px; border:1px solid #b8c0cc; border-radius:6px; background:#fff; }
+  input[type=number] { width:110px; } input[type=datetime-local] { width:210px; }
+  button { padding:7px 14px; border:0; border-radius:6px; background:#2359a6; color:#fff; cursor:pointer; }
+  button.ghost { background:#eef2f7; color:#233; border:1px solid var(--line); }
+  button.danger { background:var(--bad); } button.ok { background:var(--ok); }
+  .card { background:#fff; border:1px solid var(--line); border-radius:8px; padding:14px 16px; margin:12px 0; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  table { width:100%; border-collapse:collapse; font-size:13.5px; }
+  th, td { border-bottom:1px solid var(--line); padding:7px 9px; text-align:left; vertical-align:top; }
+  th { background:var(--bg); font-weight:600; }
+  .tag { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px; }
+  .tag.p1 { background:#fdecea; color:var(--bad); } .tag.p2 { background:#fff4e0; color:var(--warn); } .tag.p3 { background:#eef2f7; color:#3b4655; }
+  .tag.on { background:#e6f4ea; color:var(--ok); } .tag.off { background:#f1f1f1; color:#5b6675; }
+  .tag.st { border:1px solid var(--line); } .tag.bad { background:#fdecea; color:var(--bad); } .tag.stale { background:#fff4e0; color:var(--warn); }
+  .conflicts li { color:var(--bad); margin-bottom:4px; }
+  .neg { color:var(--bad); font-weight:600; } .pos { color:var(--ok); }
+  pre { background:#1e2530; color:#e8edf4; padding:12px; border-radius:8px; overflow:auto; font-size:12.5px; max-height:360px; }
+  details summary { cursor:pointer; font-weight:600; margin-bottom:8px; }
+  .hint { font-size:12.5px; color:#5b6675; }
+  #toast { position:fixed; right:20px; bottom:20px; max-width:420px; }
+  #toast div { background:#fff; border-left:4px solid var(--bad); border-radius:6px; box-shadow:0 4px 16px rgba(0,0,0,.18); padding:10px 14px; margin-top:8px; font-size:13px; white-space:pre-wrap; }
+  #toast div.ok { border-left-color:var(--ok); }
+</style>
+<h1>电网事故轮换保供调度</h1>
+<div class="muted">一级用户全程保留；二、三级用户按功率轮流分批；同一用户不得落在重叠时段；容量不足只报冲突和待调整用户，候选安排不写入。</div>
+
+<div class="bar">
+  <label>值班员 <input id="actor" value="dispatcher" style="width:130px"></label>
+  <label>角色
+    <select id="role">
+      <option value="dispatcher">dispatcher 调度员</option>
+      <option value="operator">operator</option>
+      <option value="field">field 现场</option>
+    </select>
+  </label>
+  <button class="ghost" onclick="loadState()">刷新</button>
+  <span class="hint" id="clock"></span>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h2 style="margin-top:0">编制轮换安排</h2>
+    <div class="bar" style="border:0;padding:0;gap:8px 14px">
+      <label>事故 <select id="outage" style="width:230px"></select></label>
+      <label>备用容量MW <input id="cap" type="number" step="0.1" value="120"></label>
+      <label>开始 <input id="start" type="datetime-local" step="60"></label>
+      <label>结束 <input id="end" type="datetime-local" step="60"></label>
+      <label>自动批时长(分) <input id="slot" type="number" value="120" style="width:90px"></label>
+    </div>
+    <details style="margin-top:10px">
+      <summary>手工指定批次（可留空，留空则按优先级/功率自动轮流排批）</summary>
+      <p class="hint">JSON 数组，示例：[{"batch_no":1,"start_time":"2026-09-27T08:00:00Z","end_time":"2026-09-27T10:00:00Z","facility_ids":[2,3]}]</p>
+      <textarea id="batches" rows="4" style="width:100%;font-size:12.5px" placeholder="留空 = 自动排批"></textarea>
+    </details>
+    <div style="margin-top:10px"><button class="ghost" onclick="preview()">校核候选（不写入）</button>
+      <button onclick="createSchedule()">校核并写入</button></div>
+    <div id="preview"></div>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">影响范围内用户</h2>
+    <table><thead><tr><th>ID</th><th>用户</th><th>级别</th><th>功率MW</th><th>改功率</th></tr></thead>
+    <tbody id="facilities"></tbody></table>
+    <p class="hint">修改任一用户功率后，依据旧数据编制的轮换安排立即失效，需重新编制。</p>
+  </div>
+</div>
+
+<h2>轮换安排清单</h2>
+<div id="schedules"></div>
+
+<details>
+<summary>原始状态 JSON（/api/state）</summary>
+  <pre id="raw">加载中...</pre>
+</details>
+<div id="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const headers = extra => ({...extra, "X-Actor": $("actor").value || "dispatcher", "X-Role": $("role").value, "Content-Type": "application/json"});
+function toast(msg, ok){ const d=document.createElement("div"); d.textContent=msg; if(ok)d.className="ok"; $("toast").appendChild(d); setTimeout(()=>d.remove(), 9000); }
+async function api(path, opts){
+  const r = await fetch(path, opts); const body = await r.json();
+  if(!r.ok){ const e = Object.assign(new Error(body.error||"请求失败"), {body}); throw e; }
+  return body;
+}
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function localInput(iso){ if(!iso) return ""; return iso.slice(0,16); }
+function toIso(v){ if(!v) return ""; return new Date(v).toISOString().replace(/\.\d{3}Z$/,"Z"); }
+const ptag = p => `<span class="tag p${p}">${["","一级","二级","三级"][p]||p}</span>`;
+const statag = (s,expected,mismatch) => mismatch
+  ? `<span class="tag bad">${s==="on"?"接通":"停供"}（应为${expected==="on"?"接通":"停供"}）</span>`
+  : `<span class="tag ${s}">${s==="on"?"接通":"停供"}</span>`;
+
+let STATE = null, CURRENT = null;
+
+async function loadState(){
+  STATE = await api("/api/state");
+  $("raw").textContent = JSON.stringify(STATE, null, 2);
+  renderOutages(); renderFacilities(); renderSchedules();
+  $("clock").textContent = "当前 UTC：" + new Date().toISOString().replace(/\.\d{3}Z$/,"");
+}
+
+function renderOutages(){
+  $("outage").innerHTML = STATE.outages.map(o => `<option value="${o.id}">${esc(o.incident_code)} · ${esc(o.title)} (${o.state})</option>`).join("");
+}
+
+function scopeFacilities(outageId){
+  const outage = STATE.outages.find(o => o.id === Number(outageId));
+  const regions = new Set(outage ? outage.affected_regions : []);
+  const assetRegion = {};
+  STATE.assets.forEach(a => assetRegion[a.id] = a.region);
+  return STATE.facilities.filter(f => f.connected && regions.has(assetRegion[f.asset_id]))
+    .sort((a,b) => a.priority-b.priority || a.id-b.id);
+}
+
+function renderFacilities(){
+  const list = scopeFacilities($("outage").value);
+  $("facilities").innerHTML = list.map(f => `<tr>
+    <td>${f.id}</td><td>${esc(f.name)}</td><td>${ptag(f.priority)}</td><td>${f.backup_power_mw}</td>
+    <td><input type="number" step="0.1" value="${f.backup_power_mw}" id="pw-${f.id}" style="width:80px">
+        <button class="ghost" onclick="setPower(${f.id})">保存</button></td></tr>`).join("")
+    || `<tr><td colspan="5" class="hint">该事故影响范围内无用户</td></tr>`;
+}
+
+async function setPower(id){
+  try { await api(`/api/facilities/${id}/power`, {method:"POST", headers:headers(), body: JSON.stringify({backup_power_mw: Number($("pw-"+id).value)})});
+    toast("功率已更新；基于旧数据的轮换安排已失效", true); await loadState();
+  } catch(e){ toast(e.message); }
+}
+
+function gather(){
+  let batches = null;
+  const txt = $("batches").value.trim();
+  if(txt){ try { batches = JSON.parse(txt); if(!Array.isArray(batches)) throw new Error("批次必须是数组"); } catch(e){ throw new Error("批次 JSON 不合法："+e.message); } }
+  return {outage_id: Number($("outage").value), capacity_mw: Number($("cap").value),
+          start_time: toIso($("start").value), end_time: toIso($("end").value),
+          slot_minutes: Number($("slot").value) || 120, batches};
+}
+
+async function preview(){
+  $("preview").innerHTML = "";
+  try { $("preview").innerHTML = renderCandidate((await api("/api/rotations/preview", {method:"POST", headers:headers(), body: JSON.stringify(gather())})), false); }
+  catch(e){ $("preview").innerHTML = renderCandidate(e.body && e.body.candidate, true, e.message); }
+}
+
+async function createSchedule(){
+  $("preview").innerHTML = "";
+  try { const d = await api("/api/rotations", {method:"POST", headers:headers(), body: JSON.stringify(gather())});
+    toast("轮换安排已写入：#" + d.id, true); CURRENT = d.id; await loadState(); await openSchedule(d.id);
+  } catch(e){ $("preview").innerHTML = renderCandidate(e.body && e.body.candidate, true, e.message); toast(e.message); }
+}
+
+function renderCandidate(c, isError, errMsg){
+  if(!c) return `<div class="hint">${esc(errMsg||"无候选结果")}</div>`;
+  const marginCls = v => v < 0 ? "neg" : "pos";
+  return `${c.feasible ? '<p class="pos">✔ 校核通过：各时段在供负荷均在备用容量以内。</p>'
+    : `<p class="neg">✘ ${esc(errMsg||"候选安排存在冲突，未写入")}</p>`}
+  ${c.conflicts.length ? `<ul class="conflicts">${c.conflicts.map(x=>`<li><b>[${esc(x.code)}]</b> ${esc(x.reason)}</li>`).join("")}</ul>`:""}
+  <div class="hint">一级全程保留负荷 ${c.reserved_mw}MW；待调整用户：${c.pending_facility_ids.length ? c.pending_facility_ids.join(", ") : "无"}</div>
+  <table><thead><tr><th>批次</th><th>时段(UTC)</th><th>用户（级别/功率）</th><th>在供负荷</th><th>余量</th></tr></thead><tbody>
+    ${c.rotation_table.map(b=>`<tr><td>#${b.batch_no}</td><td>${b.start_time.slice(11,16)}–${b.end_time.slice(11,16)}</td>
+      <td>${b.facilities.map(f=>`${esc(f.name)} ${ptag(f.priority)} ${f.power_mw}MW`).join("、")||'<span class="hint">（空批）</span>'}</td>
+      <td>${b.load_mw}</td><td class="${marginCls(b.margin_mw)}">${b.margin_mw}</td></tr>`).join("")}
+  </tbody></table>
+  <p class="hint">时间轴分段余量（重叠批次按同时在供并集计算）：</p>
+  <table><thead><tr><th>分段(UTC)</th><th>在供批次</th><th>负荷</th><th>余量</th></tr></thead><tbody>
+    ${c.segments.map(s=>`<tr><td>${s.start_time.slice(11,16)}–${s.end_time.slice(11,16)}</td><td>${s.batch_nos.map(n=>"#"+n).join("、")||"—"}</td>
+      <td>${s.load_mw}</td><td class="${marginCls(s.margin_mw)}">${s.margin_mw}</td></tr>`).join("")}
+  </tbody></table>
+  ${c.unscheduled.length?`<p class="hint">窗口内全程停供：${c.unscheduled.map(u=>esc(u.name)).join("、")}</p>`:""}`;
+}
+
+function renderSchedules(){
+  const el = $("schedules");
+  if(!STATE.rotations.length){ el.innerHTML = '<div class="card hint">暂无轮换安排</div>'; return; }
+  el.innerHTML = STATE.rotations.map(s => {
+    const stLabel = {active:"生效中", stale:"依据已变化", superseded:"被取代", invalidated:"已失效"}[s.state] || s.state;
+    return `<div class="card">
+      <b>#${s.id}</b> 事故 #${s.outage_id} <span class="tag st ${s.state==="active"?"on":s.state}">${stLabel}</span>
+      容量 ${s.capacity_mw}MW，${s.start_time} → ${s.end_time}，依据计划版本 v${s.basis_plan_version}（当前 v${s.current_plan_version}）
+      <button class="ghost" style="float:right" onclick="openSchedule(${s.id})">查看/现场操作</button>
+      ${s.invalid_reasons.length?`<ul class="conflicts" style="margin-top:8px">${s.invalid_reasons.map(r=>`<li>${esc(r)}</li>`).join("")}</ul>`:""}
+    </div>`;
+  }).join("");
+}
+
+async function openSchedule(id){
+  let d;
+  try { d = await api(`/api/rotations/${id}`); }
+  catch(e){ toast(e.message + (e.body&&e.body.invalid_reasons ? "\n"+e.body.invalid_reasons.join("\n") : "")); await loadState(); return; }
+  CURRENT = id;
+  document.getElementById("detail-card")?.remove();
+  const marginCls = v => v < 0 ? "neg" : "pos";
+  const invalid = d.invalid_reasons.length
+    ? `<ul class="conflicts">${d.invalid_reasons.map(r=>`<li>${esc(r)}</li>`).join("")}</ul><p class="neg">旧安排只读，请按最新功率/计划版本重新编制。</p>` : "";
+  const readonly = d.state !== "active" || d.invalid_reasons.length;
+  const html = `<div class="card" id="detail-card" style="border-color:#2359a6">
+    <h2 style="margin-top:0">轮换安排 #${d.id} <span class="tag st ${d.state==="active"?"on":d.state}">${ {active:"生效中",superseded:"被取代",invalidated:"已失效"}[d.state]||d.state }</span></h2>
+    ${invalid}
+    <div class="hint">事故 ${esc(d.incident_code||"")}（#${d.outage_id}）｜备用容量 ${d.capacity_mw}MW｜窗口 ${d.start_time} → ${d.end_time}｜依据计划 v${d.basis_plan_version}，当前 v${d.current_plan_version}｜当前UTC ${d.current_time}</div>
+    <p>一级全程保留：${d.always_on.map(f=>`${esc(f.name)} ${ptag(f.priority)} ${f.power_mw}MW`).join("、")||"无"}</p>
+    <table><thead><tr><th>批次</th><th>时段(UTC)</th><th>轮供用户</th></tr></thead><tbody>
+      ${d.rotation_table.map(b=>`<tr><td>#${b.batch_no}</td><td>${b.start_time.slice(11,16)}–${b.end_time.slice(11,16)}</td>
+        <td>${b.facilities.map(f=>`${esc(f.name)} ${ptag(f.priority)} ${f.power_mw}MW`).join("、")||'<span class="hint">空批</span>'}</td></tr>`).join("")}
+    </tbody></table>
+    <h2>分段余量（按时间轴并集）</h2>
+    <table><thead><tr><th>分段(UTC)</th><th>批次</th><th>计划负荷</th><th>计划余量</th></tr></thead><tbody>
+      ${d.segments.map(s=>`<tr><td>${s.start_time.slice(11,16)}–${s.end_time.slice(11,16)}</td><td>${s.batch_nos.map(n=>"#"+n).join("、")||"—"}</td>
+        <td>${s.load_mw}</td><td class="${marginCls(s.margin_mw)}">${s.margin_mw}</td></tr>`).join("")}
+    </tbody></table>
+    <h2>在供清单（现场接通/停供后更新）</h2>
+    <div class="hint">现场实际在供负荷 ${d.actual_load_mw}MW，对备用容量的实际余量 <span class="${marginCls(d.live_margin_mw)}">${d.live_margin_mw}MW</span>；与当前时段计划不符的条目标红。</div>
+    <table><thead><tr><th>用户</th><th>现场状态</th><th>当前时段应为</th><th>最近更新</th><th>操作</th></tr></thead><tbody>
+      ${d.supply.map(s=>`<tr><td>${esc(s.name)}</td><td>${statag(s.status,s.expected_status,s.mismatch)}</td>
+        <td>${s.expected_status==="on"?"接通":"停供"}</td><td class="hint">${esc(s.updated_by)} ${s.updated_at}${s.note?" · "+esc(s.note):""}</td>
+        <td>${readonly?'<span class="hint">只读</span>':
+          `<button class="ok" onclick="setSupply(${s.facility_id},'on')">接通</button>
+           <button class="danger" onclick="setSupply(${s.facility_id},'off')">停供</button>`}</td></tr>`).join("")}
+    </tbody></table>
+    ${d.unscheduled.length?`<p class="hint">窗口内全程停供：${d.unscheduled.map(u=>esc(u.name)).join("、")}</p>`:""}
+  </div>`;
+  $("schedules").insertAdjacentHTML("afterbegin", html);
+  window.scrollTo({top: $("schedules").offsetTop - 10, behavior:"smooth"});
+}
+
+async function setSupply(fid, status){
+  const note = prompt(`填写现场${status==="on"?"接通":"停供"}备注（可留空）`, "") ?? "";
+  try { await api("/api/supply", {method:"POST", headers:headers(), body: JSON.stringify({schedule_id: CURRENT, facility_id: fid, status, note})});
+    toast("在供清单已更新", true); await loadState(); await openSchedule(CURRENT);
+  } catch(e){ toast(e.message + (e.body&&e.body.invalid_reasons ? "\n"+e.body.invalid_reasons.join("\n") : "")); await loadState(); }
+}
+
+$("outage").addEventListener("change", renderFacilities);
+loadState();
+</script>
+</html>
